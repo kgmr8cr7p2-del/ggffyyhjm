@@ -1153,11 +1153,18 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
 
         # 🔥 MSS для захвата экрана
         self.cam = mss.mss()
+        self.screen_left = 0
+        self.screen_top = 0
+        self._last_capture_error_log = 0.0
 
     def _get_screen_size(self) -> tuple[int, int]:
-        # MSS: monitors[0] содержит виртуальный экран (all monitors).
+        # MSS: monitors[1] обычно primary monitor (со смещением left/top),
+        # monitors[0] — виртуальный desktop всех мониторов.
         try:
-            mon = self.cam.monitors[0]
+            monitors = self.cam.monitors
+            mon = monitors[1] if len(monitors) > 1 else monitors[0]
+            self.screen_left = int(mon.get("left", 0))
+            self.screen_top = int(mon.get("top", 0))
             return int(mon["width"]), int(mon["height"])
         except Exception:
             pass
@@ -1167,8 +1174,12 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         if screen is not None:
             geo = screen.geometry()
             if geo.width() > 0 and geo.height() > 0:
+                self.screen_left = int(geo.left())
+                self.screen_top = int(geo.top())
                 return int(geo.width()), int(geo.height())
 
+        self.screen_left = 0
+        self.screen_top = 0
         return 1920, 1080
 
     def _input_worker(self) -> None:
@@ -1623,10 +1634,13 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         return True, frame_bgr
 
     def _navigation_step(self) -> None:
-        mm_region = {"left": self.MINIMAP_REGION["left"], "top": self.MINIMAP_REGION["top"], "width": self.MINIMAP_REGION["width"], "height": self.MINIMAP_REGION["height"]}
+        mm_region = {"left": self.screen_left + self.MINIMAP_REGION["left"], "top": self.screen_top + self.MINIMAP_REGION["top"], "width": self.MINIMAP_REGION["width"], "height": self.MINIMAP_REGION["height"]}
         try:
             mm = np.array(self.cam.grab(mm_region))
-        except Exception:
+        except Exception as e:
+            if time.time() - self._last_capture_error_log > 1.0:
+                self.log(f"Ошибка захвата миникарты (mss): {e}")
+                self._last_capture_error_log = time.time()
             return
         minimap = cv2.cvtColor(mm, cv2.COLOR_BGRA2BGR) if mm.shape[2] == 4 else mm
 
@@ -1664,8 +1678,8 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
 
             combat_fov = int(cfg.combat_fov)
             reg = {
-                "left": int(sw // 2 - combat_fov // 2),
-                "top": int(sh // 2 - combat_fov // 2),
+                "left": int(self.screen_left + sw // 2 - combat_fov // 2),
+                "top": int(self.screen_top + sh // 2 - combat_fov // 2),
                 "width": combat_fov,
                 "height": combat_fov,
             }
@@ -1681,7 +1695,10 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
             region_tuple = {"left": reg["left"], "top": reg["top"], "width": reg["width"], "height": reg["height"]}
             try:
                 frame = np.array(self.cam.grab(region_tuple))
-            except Exception:
+            except Exception as e:
+                if time.time() - self._last_capture_error_log > 1.0:
+                    self.log(f"Ошибка захвата FOV (mss): {e}")
+                    self._last_capture_error_log = time.time()
                 continue
             fov_frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR) if frame.shape[2] == 4 else frame
             cv2.circle(fov_frame, (center, center), 4, (255, 255, 255), -1)
