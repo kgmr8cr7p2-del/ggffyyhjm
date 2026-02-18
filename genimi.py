@@ -1151,8 +1151,55 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         self.pid_y.clear()
         self._last_error_dist = 0  # Для трекинга изменений
 
-        # 🔥 BetterCam для захвата экрана
-        self.cam = bettercam.create(device=0, output_color="BGR", max_buffer_len=512)
+        # 🔥 BetterCam для захвата экрана (совместимость разных версий bettercam/dxcam)
+        self.cam = self._create_camera()
+
+    def _create_camera(self):
+        create_variants = [
+            {"device": 0, "output_color": "BGR", "max_buffer_len": 512},
+            {"device_idx": 0, "output_color": "BGR", "max_buffer_len": 512},
+            {"output_idx": 0, "output_color": "BGR", "max_buffer_len": 512},
+            {"output_color": "BGR", "max_buffer_len": 512},
+        ]
+        last_error = None
+        for kwargs in create_variants:
+            try:
+                cam = bettercam.create(**kwargs)
+                self.log(f"BetterCam инициализирован с параметрами: {kwargs}")
+                return cam
+            except TypeError as e:
+                last_error = e
+                continue
+            except Exception as e:
+                last_error = e
+                break
+
+        raise RuntimeError(f"Не удалось инициализировать BetterCam: {last_error}")
+
+    def _get_screen_size(self) -> tuple[int, int]:
+        # Пытаемся получить размер экрана через BetterCam, но без падения на старых версиях API.
+        try:
+            frame = self.cam.get_latest_frame()
+            if frame is not None and getattr(frame, "shape", None) is not None:
+                return int(frame.shape[1]), int(frame.shape[0])
+        except Exception:
+            pass
+
+        try:
+            frame = self.cam.grab()
+            if frame is not None and getattr(frame, "shape", None) is not None:
+                return int(frame.shape[1]), int(frame.shape[0])
+        except Exception:
+            pass
+
+        # Надежный fallback для Windows (приложение PyQt6): берем геометрию primary screen.
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.geometry()
+            if geo.width() > 0 and geo.height() > 0:
+                return int(geo.width()), int(geo.height())
+
+        return 1920, 1080
 
     def _input_worker(self) -> None:
         while True:
@@ -1634,8 +1681,7 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         self.input_queue.put(('key_down', W_KEY))
 
     def run(self) -> None:  # 🔥 Теперь это метод QThread
-        mon = self.cam.get_latest_frame().shape  # BetterCam не имеет monitors, но можем взять размер экрана
-        sw, sh = mon[1], mon[0]  # width, height
+        sw, sh = self._get_screen_size()
         self.log("Поток бота запущен")
         self.log(f"Debug-лог наведения: {self.aim_debug_file}")
 
