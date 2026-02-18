@@ -1365,7 +1365,13 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
 
         _, conf, x1, y1, x2, y2, tx, ty = target
         height = y2 - y1
-        ty -= height * cfg.aim_head_offset_percent  # 🔥 Dynamic head offset
+
+        # 🔥 Dynamic head offset: адаптация под дистанцию/размер бокса в FOV.
+        # Маленький бокс (дальняя цель) => чуть выше в голову; крупный (близко) => мягче.
+        relative_box_height = clamp(height / max(1.0, float(cfg.combat_fov)), 0.08, 0.70)
+        adaptive_head_percent = cfg.aim_head_offset_percent + (0.35 - relative_box_height) * 0.18
+        adaptive_head_percent = clamp(adaptive_head_percent, 0.12, 0.45)
+        ty -= height * adaptive_head_percent
 
         # 🔥 Kalman filter [x,y,vx,vy,ax,ay] + предсказание при пропусках детекции
         raw_tx = float(tx)
@@ -1373,8 +1379,9 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         dt_det = max(0.001, min(time.time() - self.last_detection_ts, 0.20))
         kx, ky, kvx, kvy, kax, kay = self.kalman.update(raw_tx, raw_ty, dt_det)
 
-        tx = kx + kvx * cfg.prediction_frames + 0.5 * kax * (cfg.prediction_frames ** 2)
-        ty = ky + kvy * cfg.prediction_frames + 0.5 * kay * (cfg.prediction_frames ** 2)
+        prediction_time = max(0.0, float(cfg.prediction_frames)) * dt_det
+        tx = kx + kvx * prediction_time + 0.5 * kax * (prediction_time ** 2)
+        ty = ky + kvy * prediction_time + 0.5 * kay * (prediction_time ** 2)
         self.tx_vel = kvx
         self.ty_vel = kvy
         self.last_tx = tx
@@ -1423,12 +1430,17 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         # 🔥 Динамический PID: kp выше для дальних, kd выше для близких
         base_kp = cfg.pid_kp
         base_kd = cfg.pid_kd
-        kp_scale = 1.0 + (error_dist / 200.0)  # Больше kp для дальних (быстрый snap)
-        kd_scale = 1.0 + (50.0 / (error_dist + 1.0))  # Больше kd для близких (гашение тряски)
+        base_ki = cfg.pid_ki
+        error_norm = clamp(error_dist / max(1.0, cfg.combat_fov * 0.5), 0.0, 1.5)
+        kp_scale = 1.0 + 1.8 * error_norm  # Чем дальше, тем агрессивнее рывок
+        kd_scale = 1.0 + 1.6 * (1.0 - min(error_norm, 1.0))  # Чем ближе, тем больше демпфирование
+        ki_scale = 0.55 + 0.65 * error_norm  # На близкой цели меньше интеграла, чтобы не "трясло"
         self.pid_x.kp = base_kp * kp_scale
         self.pid_x.kd = base_kd * kd_scale
+        self.pid_x.ki = base_ki * ki_scale
         self.pid_y.kp = base_kp * kp_scale
         self.pid_y.kd = base_kd * kd_scale
+        self.pid_y.ki = base_ki * ki_scale
 
         if in_deadzone:
             dx = 0.0
