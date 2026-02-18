@@ -47,7 +47,7 @@ from walk import RouteNavigator, SpawnDetector
 from pynput.keyboard import Key, Listener
 
 # 🔥 Для оптимизации захвата экрана
-import bettercam
+import mss
 
 
 @dataclass
@@ -1151,8 +1151,36 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         self.pid_y.clear()
         self._last_error_dist = 0  # Для трекинга изменений
 
-        # 🔥 BetterCam для захвата экрана
-        self.cam = bettercam.create(device=0, output_color="BGR", max_buffer_len=512)
+        # 🔥 MSS для захвата экрана
+        self.cam = mss.mss()
+        self.screen_left = 0
+        self.screen_top = 0
+        self._last_capture_error_log = 0.0
+
+    def _get_screen_size(self) -> tuple[int, int]:
+        # MSS: monitors[1] обычно primary monitor (со смещением left/top),
+        # monitors[0] — виртуальный desktop всех мониторов.
+        try:
+            monitors = self.cam.monitors
+            mon = monitors[1] if len(monitors) > 1 else monitors[0]
+            self.screen_left = int(mon.get("left", 0))
+            self.screen_top = int(mon.get("top", 0))
+            return int(mon["width"]), int(mon["height"])
+        except Exception:
+            pass
+
+        # fallback для окружений без доступа к монитору.
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.geometry()
+            if geo.width() > 0 and geo.height() > 0:
+                self.screen_left = int(geo.left())
+                self.screen_top = int(geo.top())
+                return int(geo.width()), int(geo.height())
+
+        self.screen_left = 0
+        self.screen_top = 0
+        return 1920, 1080
 
     def _input_worker(self) -> None:
         while True:
@@ -1365,7 +1393,13 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
 
         _, conf, x1, y1, x2, y2, tx, ty = target
         height = y2 - y1
-        ty -= height * cfg.aim_head_offset_percent  # 🔥 Dynamic head offset
+
+        # 🔥 Dynamic head offset: адаптация под дистанцию/размер бокса в FOV.
+        # Маленький бокс (дальняя цель) => чуть выше в голову; крупный (близко) => мягче.
+        relative_box_height = clamp(height / max(1.0, float(cfg.combat_fov)), 0.08, 0.70)
+        adaptive_head_percent = cfg.aim_head_offset_percent + (0.35 - relative_box_height) * 0.18
+        adaptive_head_percent = clamp(adaptive_head_percent, 0.12, 0.45)
+        ty -= height * adaptive_head_percent
 
         # 🔥 Kalman filter [x,y,vx,vy,ax,ay] + предсказание при пропусках детекции
         raw_tx = float(tx)
@@ -1373,8 +1407,9 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         dt_det = max(0.001, min(time.time() - self.last_detection_ts, 0.20))
         kx, ky, kvx, kvy, kax, kay = self.kalman.update(raw_tx, raw_ty, dt_det)
 
-        tx = kx + kvx * cfg.prediction_frames + 0.5 * kax * (cfg.prediction_frames ** 2)
-        ty = ky + kvy * cfg.prediction_frames + 0.5 * kay * (cfg.prediction_frames ** 2)
+        prediction_time = max(0.0, float(cfg.prediction_frames)) * dt_det
+        tx = kx + kvx * prediction_time + 0.5 * kax * (prediction_time ** 2)
+        ty = ky + kvy * prediction_time + 0.5 * kay * (prediction_time ** 2)
         self.tx_vel = kvx
         self.ty_vel = kvy
         self.last_tx = tx
@@ -1423,12 +1458,17 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         # 🔥 Динамический PID: kp выше для дальних, kd выше для близких
         base_kp = cfg.pid_kp
         base_kd = cfg.pid_kd
-        kp_scale = 1.0 + (error_dist / 200.0)  # Больше kp для дальних (быстрый snap)
-        kd_scale = 1.0 + (50.0 / (error_dist + 1.0))  # Больше kd для близких (гашение тряски)
+        base_ki = cfg.pid_ki
+        error_norm = clamp(error_dist / max(1.0, cfg.combat_fov * 0.5), 0.0, 1.5)
+        kp_scale = 1.0 + 1.8 * error_norm  # Чем дальше, тем агрессивнее рывок
+        kd_scale = 1.0 + 1.6 * (1.0 - min(error_norm, 1.0))  # Чем ближе, тем больше демпфирование
+        ki_scale = 0.55 + 0.65 * error_norm  # На близкой цели меньше интеграла, чтобы не "трясло"
         self.pid_x.kp = base_kp * kp_scale
         self.pid_x.kd = base_kd * kd_scale
+        self.pid_x.ki = base_ki * ki_scale
         self.pid_y.kp = base_kp * kp_scale
         self.pid_y.kd = base_kd * kd_scale
+        self.pid_y.ki = base_ki * ki_scale
 
         if in_deadzone:
             dx = 0.0
@@ -1594,9 +1634,13 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         return True, frame_bgr
 
     def _navigation_step(self) -> None:
-        mm_region = (self.MINIMAP_REGION["left"], self.MINIMAP_REGION["top"], self.MINIMAP_REGION["left"] + self.MINIMAP_REGION["width"], self.MINIMAP_REGION["top"] + self.MINIMAP_REGION["height"])
-        mm = self.cam.grab(mm_region)
-        if mm is None:
+        mm_region = {"left": self.screen_left + self.MINIMAP_REGION["left"], "top": self.screen_top + self.MINIMAP_REGION["top"], "width": self.MINIMAP_REGION["width"], "height": self.MINIMAP_REGION["height"]}
+        try:
+            mm = np.array(self.cam.grab(mm_region))
+        except Exception as e:
+            if time.time() - self._last_capture_error_log > 1.0:
+                self.log(f"Ошибка захвата миникарты (mss): {e}")
+                self._last_capture_error_log = time.time()
             return
         minimap = cv2.cvtColor(mm, cv2.COLOR_BGRA2BGR) if mm.shape[2] == 4 else mm
 
@@ -1622,8 +1666,7 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         self.input_queue.put(('key_down', W_KEY))
 
     def run(self) -> None:  # 🔥 Теперь это метод QThread
-        mon = self.cam.get_latest_frame().shape  # BetterCam не имеет monitors, но можем взять размер экрана
-        sw, sh = mon[1], mon[0]  # width, height
+        sw, sh = self._get_screen_size()
         self.log("Поток бота запущен")
         self.log(f"Debug-лог наведения: {self.aim_debug_file}")
 
@@ -1635,8 +1678,8 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
 
             combat_fov = int(cfg.combat_fov)
             reg = {
-                "left": int(sw // 2 - combat_fov // 2),
-                "top": int(sh // 2 - combat_fov // 2),
+                "left": int(self.screen_left + sw // 2 - combat_fov // 2),
+                "top": int(self.screen_top + sh // 2 - combat_fov // 2),
                 "width": combat_fov,
                 "height": combat_fov,
             }
@@ -1649,9 +1692,13 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
                 self.state.manual_route = None
 
             t_capture_start = time.time()
-            region_tuple = (reg["left"], reg["top"], reg["left"] + reg["width"], reg["top"] + reg["height"])
-            frame = self.cam.grab(region_tuple)
-            if frame is None:
+            region_tuple = {"left": reg["left"], "top": reg["top"], "width": reg["width"], "height": reg["height"]}
+            try:
+                frame = np.array(self.cam.grab(region_tuple))
+            except Exception as e:
+                if time.time() - self._last_capture_error_log > 1.0:
+                    self.log(f"Ошибка захвата FOV (mss): {e}")
+                    self._last_capture_error_log = time.time()
                 continue
             fov_frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR) if frame.shape[2] == 4 else frame
             cv2.circle(fov_frame, (center, center), 4, (255, 255, 255), -1)
