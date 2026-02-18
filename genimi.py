@@ -47,7 +47,7 @@ from walk import RouteNavigator, SpawnDetector
 from pynput.keyboard import Key, Listener
 
 # 🔥 Для оптимизации захвата экрана
-import bettercam
+import mss
 
 
 @dataclass
@@ -1151,48 +1151,18 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         self.pid_y.clear()
         self._last_error_dist = 0  # Для трекинга изменений
 
-        # 🔥 BetterCam для захвата экрана (совместимость разных версий bettercam/dxcam)
-        self.cam = self._create_camera()
-
-    def _create_camera(self):
-        create_variants = [
-            {"device": 0, "output_color": "BGR", "max_buffer_len": 512},
-            {"device_idx": 0, "output_color": "BGR", "max_buffer_len": 512},
-            {"output_idx": 0, "output_color": "BGR", "max_buffer_len": 512},
-            {"output_color": "BGR", "max_buffer_len": 512},
-        ]
-        last_error = None
-        for kwargs in create_variants:
-            try:
-                cam = bettercam.create(**kwargs)
-                self.log(f"BetterCam инициализирован с параметрами: {kwargs}")
-                return cam
-            except TypeError as e:
-                last_error = e
-                continue
-            except Exception as e:
-                last_error = e
-                break
-
-        raise RuntimeError(f"Не удалось инициализировать BetterCam: {last_error}")
+        # 🔥 MSS для захвата экрана
+        self.cam = mss.mss()
 
     def _get_screen_size(self) -> tuple[int, int]:
-        # Пытаемся получить размер экрана через BetterCam, но без падения на старых версиях API.
+        # MSS: monitors[0] содержит виртуальный экран (all monitors).
         try:
-            frame = self.cam.get_latest_frame()
-            if frame is not None and getattr(frame, "shape", None) is not None:
-                return int(frame.shape[1]), int(frame.shape[0])
+            mon = self.cam.monitors[0]
+            return int(mon["width"]), int(mon["height"])
         except Exception:
             pass
 
-        try:
-            frame = self.cam.grab()
-            if frame is not None and getattr(frame, "shape", None) is not None:
-                return int(frame.shape[1]), int(frame.shape[0])
-        except Exception:
-            pass
-
-        # Надежный fallback для Windows (приложение PyQt6): берем геометрию primary screen.
+        # fallback для окружений без доступа к монитору.
         screen = QApplication.primaryScreen()
         if screen is not None:
             geo = screen.geometry()
@@ -1653,9 +1623,10 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         return True, frame_bgr
 
     def _navigation_step(self) -> None:
-        mm_region = (self.MINIMAP_REGION["left"], self.MINIMAP_REGION["top"], self.MINIMAP_REGION["left"] + self.MINIMAP_REGION["width"], self.MINIMAP_REGION["top"] + self.MINIMAP_REGION["height"])
-        mm = self.cam.grab(mm_region)
-        if mm is None:
+        mm_region = {"left": self.MINIMAP_REGION["left"], "top": self.MINIMAP_REGION["top"], "width": self.MINIMAP_REGION["width"], "height": self.MINIMAP_REGION["height"]}
+        try:
+            mm = np.array(self.cam.grab(mm_region))
+        except Exception:
             return
         minimap = cv2.cvtColor(mm, cv2.COLOR_BGRA2BGR) if mm.shape[2] == 4 else mm
 
@@ -1707,9 +1678,10 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
                 self.state.manual_route = None
 
             t_capture_start = time.time()
-            region_tuple = (reg["left"], reg["top"], reg["left"] + reg["width"], reg["top"] + reg["height"])
-            frame = self.cam.grab(region_tuple)
-            if frame is None:
+            region_tuple = {"left": reg["left"], "top": reg["top"], "width": reg["width"], "height": reg["height"]}
+            try:
+                frame = np.array(self.cam.grab(region_tuple))
+            except Exception:
                 continue
             fov_frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR) if frame.shape[2] == 4 else frame
             cv2.circle(fov_frame, (center, center), 4, (255, 255, 255), -1)
