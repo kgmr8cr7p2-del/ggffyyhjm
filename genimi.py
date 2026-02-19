@@ -47,7 +47,7 @@ from walk import RouteNavigator, SpawnDetector
 from pynput.keyboard import Key, Listener
 
 # 🔥 Для оптимизации захвата экрана
-import bettercam
+import mss
 
 
 @dataclass
@@ -77,6 +77,9 @@ class AimConfig:
     use_bezier: bool = False  # Кривые Безье для human-like движения
     bezier_intensity: float = 10.0  # Интенсивность кривизны Безье (0-50 px). Выше - сильнее изгиб
     bezier_steps: int = 4  # Количество шагов Безье (2-10). Больше - плавнее
+    one_euro_min_cutoff: float = 1.2  # Базовая частота среза One Euro (0.1-10.0)
+    one_euro_beta: float = 0.35  # Адаптация сглаживания по скорости (0.0-5.0)
+    one_euro_d_cutoff: float = 1.0  # Частота среза производной для One Euro (0.1-10.0)
 
     # Стрельба
     auto_shoot: bool = False  # Авто-стрельба при наведении (по умолчанию выключена)
@@ -391,6 +394,39 @@ class CombatWalkBotWindow(QWidget):
         self.sb_deadzone_hyst.setValue(cfg.deadzone_hysteresis_px)
         self.sb_deadzone_hyst.valueChanged.connect(lambda v: self._update_config("deadzone_hysteresis_px", float(v)))
         aim_form.addRow(label_deadzone_hyst, self.sb_deadzone_hyst)
+
+        label_one_euro_min_cutoff = QLabel("One Euro: базовое сглаживание")
+        label_one_euro_min_cutoff.setToolTip("Главная ручка плавности наведения. Ниже значение — плавнее (но медленнее реакция), выше — резче и быстрее отклик. Рекомендация: 1.0-1.6 для баланса.")
+        self.sb_one_euro_min_cutoff = QDoubleSpinBox()
+        self.sb_one_euro_min_cutoff.setRange(0.1, 10.0)
+        self.sb_one_euro_min_cutoff.setSingleStep(0.1)
+        self.sb_one_euro_min_cutoff.setDecimals(2)
+        self.sb_one_euro_min_cutoff.setValue(cfg.one_euro_min_cutoff)
+        self.sb_one_euro_min_cutoff.valueChanged.connect(lambda v: self._update_config("one_euro_min_cutoff", float(v)))
+        self.sb_one_euro_min_cutoff.setToolTip(label_one_euro_min_cutoff.toolTip())
+        aim_form.addRow(label_one_euro_min_cutoff, self.sb_one_euro_min_cutoff)
+
+        label_one_euro_beta = QLabel("One Euro: реакция на резкие движения")
+        label_one_euro_beta.setToolTip("Насколько быстро фильтр 'отпускает' сглаживание при резких рывках цели. Больше — быстрее догоняет цель, меньше — стабильнее и мягче. Рекомендация: 0.2-0.6.")
+        self.sb_one_euro_beta = QDoubleSpinBox()
+        self.sb_one_euro_beta.setRange(0.0, 5.0)
+        self.sb_one_euro_beta.setSingleStep(0.05)
+        self.sb_one_euro_beta.setDecimals(2)
+        self.sb_one_euro_beta.setValue(cfg.one_euro_beta)
+        self.sb_one_euro_beta.valueChanged.connect(lambda v: self._update_config("one_euro_beta", float(v)))
+        self.sb_one_euro_beta.setToolTip(label_one_euro_beta.toolTip())
+        aim_form.addRow(label_one_euro_beta, self.sb_one_euro_beta)
+
+        label_one_euro_d_cutoff = QLabel("One Euro: сглаживание скорости")
+        label_one_euro_d_cutoff.setToolTip("Сглаживание для оценки скорости движения цели. Обычно оставляют 1.0. Увеличивайте, если есть шумные скачки скорости, уменьшайте для более 'живой' реакции.")
+        self.sb_one_euro_d_cutoff = QDoubleSpinBox()
+        self.sb_one_euro_d_cutoff.setRange(0.1, 10.0)
+        self.sb_one_euro_d_cutoff.setSingleStep(0.1)
+        self.sb_one_euro_d_cutoff.setDecimals(2)
+        self.sb_one_euro_d_cutoff.setValue(cfg.one_euro_d_cutoff)
+        self.sb_one_euro_d_cutoff.valueChanged.connect(lambda v: self._update_config("one_euro_d_cutoff", float(v)))
+        self.sb_one_euro_d_cutoff.setToolTip(label_one_euro_d_cutoff.toolTip())
+        aim_form.addRow(label_one_euro_d_cutoff, self.sb_one_euro_d_cutoff)
 
         label_max_speed = QLabel("Макс скорость (px/sec)")
         self.sb_max_speed = QDoubleSpinBox()
@@ -708,6 +744,9 @@ class CombatWalkBotWindow(QWidget):
         self.cb_bezier.setChecked(self.state.config.use_bezier)
         self.sb_bezier_intensity.setValue(self.state.config.bezier_intensity)
         self.sb_bezier_steps.setValue(self.state.config.bezier_steps)
+        self.sb_one_euro_min_cutoff.setValue(self.state.config.one_euro_min_cutoff)
+        self.sb_one_euro_beta.setValue(self.state.config.one_euro_beta)
+        self.sb_one_euro_d_cutoff.setValue(self.state.config.one_euro_d_cutoff)
         self.cb_autoshoot.setChecked(self.state.config.auto_shoot)
         self.sb_cd.setValue(self.state.config.shoot_cooldown_sec)
         self.sb_click_hold.setValue(self.state.config.shoot_click_delay_sec)
@@ -1016,6 +1055,68 @@ class PID:
         return output
 
 
+class LowPassFilter:
+    """Базовый low-pass фильтр для One Euro Filter."""
+
+    def __init__(self):
+        self.s = 0.0
+        self.initialized = False
+
+    def reset(self) -> None:
+        self.s = 0.0
+        self.initialized = False
+
+    def filter(self, value: float, alpha: float) -> float:
+        alpha = clamp(alpha, 0.0, 1.0)
+        if not self.initialized:
+            self.s = float(value)
+            self.initialized = True
+            return self.s
+        self.s = alpha * float(value) + (1.0 - alpha) * self.s
+        return self.s
+
+
+class OneEuroFilter:
+    """One Euro Filter для плавного и отзывчивого сглаживания движения."""
+
+    def __init__(self, min_cutoff: float = 1.2, beta: float = 0.35, d_cutoff: float = 1.0):
+        self.min_cutoff = max(0.001, float(min_cutoff))
+        self.beta = max(0.0, float(beta))
+        self.d_cutoff = max(0.001, float(d_cutoff))
+        self.x_filter = LowPassFilter()
+        self.dx_filter = LowPassFilter()
+        self.last_value: Optional[float] = None
+
+    def reset(self) -> None:
+        self.x_filter.reset()
+        self.dx_filter.reset()
+        self.last_value = None
+
+    @staticmethod
+    def _alpha(dt: float, cutoff: float) -> float:
+        tau = 1.0 / (2.0 * math.pi * max(0.001, cutoff))
+        return 1.0 / (1.0 + tau / max(0.001, dt))
+
+    def filter(self, value: float, dt: float) -> float:
+        dt = max(0.001, min(float(dt), 0.20))
+        value = float(value)
+
+        if self.last_value is None:
+            derivative = 0.0
+        else:
+            derivative = (value - self.last_value) / dt
+
+        d_alpha = self._alpha(dt, self.d_cutoff)
+        edx = self.dx_filter.filter(derivative, d_alpha)
+
+        cutoff = self.min_cutoff + self.beta * abs(edx)
+        x_alpha = self._alpha(dt, cutoff)
+        filtered = self.x_filter.filter(value, x_alpha)
+
+        self.last_value = value
+        return filtered
+
+
 # 🔥 Функция для YOLO процесса
 def yolo_detection_process(input_q: mp.Queue, output_q: mp.Queue, device: str, model_type: str, conf_threshold: float, use_fp16: bool, use_int8: bool):
     model_path = "yolov10n.pt"  # 🔥 Изменено на YOLOv10n
@@ -1111,8 +1212,8 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         self.prev_move_y = 0.0
         self.prev_vel_x = 0.0  # 🔥 Новый для velocity
         self.prev_vel_y = 0.0
-        self.filtered_tx: Optional[float] = None
-        self.filtered_ty: Optional[float] = None
+        self.one_euro_x = OneEuroFilter(cfg.one_euro_min_cutoff, cfg.one_euro_beta, cfg.one_euro_d_cutoff)
+        self.one_euro_y = OneEuroFilter(cfg.one_euro_min_cutoff, cfg.one_euro_beta, cfg.one_euro_d_cutoff)
 
         # 🔥 Stop event
         self.stop_event = threading.Event()
@@ -1151,8 +1252,8 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         self.pid_y.clear()
         self._last_error_dist = 0  # Для трекинга изменений
 
-        # 🔥 BetterCam для захвата экрана
-        self.cam = bettercam.create(device=0, output_color="BGR", max_buffer_len=512)
+        # 🔥 MSS инициализируем в run() (в том же потоке, где используем)
+        self.sct: Optional[mss.mss] = None
 
     def _input_worker(self) -> None:
         while True:
@@ -1306,8 +1407,8 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
             self.last_target_bbox = None
             self.prev_move_x = 0.0
             self.prev_move_y = 0.0
-            self.filtered_tx = None
-            self.filtered_ty = None
+            self.one_euro_x.reset()
+            self.one_euro_y.reset()
             self.tx_vel = 0.0
             self.ty_vel = 0.0
             self.prev_deadzone_active = False
@@ -1337,8 +1438,8 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
             self.last_target_bbox = None
             self.prev_move_x = 0.0
             self.prev_move_y = 0.0
-            self.filtered_tx = None
-            self.filtered_ty = None
+            self.one_euro_x.reset()
+            self.one_euro_y.reset()
             self.tx_vel = 0.0
             self.ty_vel = 0.0
             self.prev_deadzone_active = False
@@ -1462,13 +1563,17 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         move_x = self.prev_vel_x * dt
         move_y = self.prev_vel_y * dt
 
-        # Exp average (alpha=0.3-0.6)
-        alpha = 0.4 if error_dist > 50 else 0.2
-        move_x = alpha * move_x + (1 - alpha) * self.prev_move_x
-        move_y = alpha * move_y + (1 - alpha) * self.prev_move_y
+        # One Euro Filter вместо EMA: адаптивно сглаживает мелкую дрожь, но быстрее реагирует на большие рывки
+        self.one_euro_x.min_cutoff = max(0.1, cfg.one_euro_min_cutoff)
+        self.one_euro_x.beta = max(0.0, cfg.one_euro_beta)
+        self.one_euro_x.d_cutoff = max(0.1, cfg.one_euro_d_cutoff)
+        self.one_euro_y.min_cutoff = self.one_euro_x.min_cutoff
+        self.one_euro_y.beta = self.one_euro_x.beta
+        self.one_euro_y.d_cutoff = self.one_euro_x.d_cutoff
+        move_x = self.one_euro_x.filter(move_x, dt)
+        move_y = self.one_euro_y.filter(move_y, dt)
 
         self.prev_move_x, self.prev_move_y = move_x, move_y
-        self.prev_vel_x, self.prev_vel_y = self.prev_vel_x, self.prev_vel_y  # Save
 
         t_input_start = time.time()
         queue_size_before = self.input_queue.qsize()
@@ -1593,12 +1698,33 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
 
         return True, frame_bgr
 
+    def _grab_bgr(self, region: dict[str, int]) -> Optional[np.ndarray]:
+        if self.sct is None:
+            return None
+        try:
+            shot = self.sct.grab({
+                "left": int(region["left"]),
+                "top": int(region["top"]),
+                "width": int(region["width"]),
+                "height": int(region["height"]),
+            })
+        except Exception as e:
+            self.log(f"Ошибка захвата экрана (mss): {e}")
+            return None
+        frame = np.array(shot)
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
     def _navigation_step(self) -> None:
-        mm_region = (self.MINIMAP_REGION["left"], self.MINIMAP_REGION["top"], self.MINIMAP_REGION["left"] + self.MINIMAP_REGION["width"], self.MINIMAP_REGION["top"] + self.MINIMAP_REGION["height"])
-        mm = self.cam.grab(mm_region)
+        mm_region = {
+            "left": self.MINIMAP_REGION["left"],
+            "top": self.MINIMAP_REGION["top"],
+            "width": self.MINIMAP_REGION["width"],
+            "height": self.MINIMAP_REGION["height"],
+        }
+        mm = self._grab_bgr(mm_region)
         if mm is None:
             return
-        minimap = cv2.cvtColor(mm, cv2.COLOR_BGRA2BGR) if mm.shape[2] == 4 else mm
+        minimap = mm
 
         pos = self._detect_arrow_position(minimap)
         if pos is None:
@@ -1622,86 +1748,94 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         self.input_queue.put(('key_down', W_KEY))
 
     def run(self) -> None:  # 🔥 Теперь это метод QThread
-        mon = self.cam.get_latest_frame().shape  # BetterCam не имеет monitors, но можем взять размер экрана
-        sw, sh = mon[1], mon[0]  # width, height
-        self.log("Поток бота запущен")
-        self.log(f"Debug-лог наведения: {self.aim_debug_file}")
+        self.sct = mss.mss()  # Важно: создаем в рабочем потоке (fix thread.local/srcdc)
+        try:
+            monitor = self.sct.monitors[1]  # Основной монитор MSS
+            sw, sh = int(monitor["width"]), int(monitor["height"])
+            self.log("Поток бота запущен")
+            self.log(f"Debug-лог наведения: {self.aim_debug_file}")
 
-        while not self.stop_event.is_set():
-            cfg = self.state.config
-            if cfg.desktop_test_mode != self._desktop_prev:
-                self.log(f"Режим проверки на рабочем столе: {'ВКЛ' if cfg.desktop_test_mode else 'ВЫКЛ'}")
-                self._desktop_prev = cfg.desktop_test_mode
-
-            combat_fov = int(cfg.combat_fov)
-            reg = {
-                "left": int(sw // 2 - combat_fov // 2),
-                "top": int(sh // 2 - combat_fov // 2),
-                "width": combat_fov,
-                "height": combat_fov,
-            }
-            center = combat_fov // 2
-
-            self.recorder.update()
-
-            if self.state.manual_route is not None:
-                self._load_route(self.state.manual_route)
-                self.state.manual_route = None
-
-            t_capture_start = time.time()
-            region_tuple = (reg["left"], reg["top"], reg["left"] + reg["width"], reg["top"] + reg["height"])
-            frame = self.cam.grab(region_tuple)
-            if frame is None:
-                continue
-            fov_frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR) if frame.shape[2] == 4 else frame
-            cv2.circle(fov_frame, (center, center), 4, (255, 255, 255), -1)
-            cv2.circle(fov_frame, (center, center), max(8, center - 2), (255, 180, 0), 1)
-            t_capture = (time.time() - t_capture_start) * 1000
-
-            self.t_capture_list.append(t_capture)
-
-            if t_capture > 20:  # 🔥 Adaptive sleep
-                time.sleep(0.005)
-
-            has_target = False
-            if self.state.running:
-                while self.input_yolo_q.qsize() > 1:
-                    try:
-                        self.input_yolo_q.get_nowait()
-                    except Exception:
-                        break
-                has_target, fov_frame = self._combat_step(fov_frame, center, reg, desktop_mode=cfg.desktop_test_mode)
-                if not has_target or not cfg.nav_pause_when_enemy:
-                    self._navigation_step()
-            else:
-                self.input_queue.put(('release_all',))
-                self.state.target_lock_signal.emit([])
-
-            self.state.frame_signal.emit(fov_frame)
-
-            # 🔥 Расчет FPS
-            self.frame_count += 1
-            elapsed = time.time() - self.fps_start_time
-            if elapsed >= 1.0:
-                self.fps = self.frame_count / elapsed
-                t_capture_avg = sum(self.t_capture_list) / len(self.t_capture_list) if self.t_capture_list else 0
-                t_infer_avg = sum(self.t_infer_list) / len(self.t_infer_list) if self.t_infer_list else 0
-                t_post_avg = sum(self.t_post_list) / len(self.t_post_list) if self.t_post_list else 0
-                t_input_avg = sum(self.t_input_list) / len(self.t_input_list) if self.t_input_list else 0
-                latency_avg = sum(self.latency_list) / len(self.latency_list) if self.latency_list else 0
-                self.state.performance_signal.emit(self.fps, latency_avg, t_capture_avg, t_infer_avg, t_post_avg, t_input_avg)
-                self.frame_count = 0
-                self.fps_start_time = time.time()
-                self.t_capture_list = []
-                self.t_infer_list = []
-                self.t_post_list = []
-                self.t_input_list = []
-                self.latency_list = []
-
-            # 🔥 Рандомизация cycle sleep
-            randomized_sleep = cfg.cycle_sleep_sec + random.uniform(-cfg.random_timing_variance, cfg.random_timing_variance)
-            randomized_sleep = max(0.001, randomized_sleep)  # Min bound
-            time.sleep(randomized_sleep)  # 🔥 Configurable sleep
+            while not self.stop_event.is_set():
+                cfg = self.state.config
+                if cfg.desktop_test_mode != self._desktop_prev:
+                    self.log(f"Режим проверки на рабочем столе: {'ВКЛ' if cfg.desktop_test_mode else 'ВЫКЛ'}")
+                    self._desktop_prev = cfg.desktop_test_mode
+    
+                combat_fov = int(cfg.combat_fov)
+                reg = {
+                    "left": int(sw // 2 - combat_fov // 2),
+                    "top": int(sh // 2 - combat_fov // 2),
+                    "width": combat_fov,
+                    "height": combat_fov,
+                }
+                center = combat_fov // 2
+    
+                self.recorder.update()
+    
+                if self.state.manual_route is not None:
+                    self._load_route(self.state.manual_route)
+                    self.state.manual_route = None
+    
+                t_capture_start = time.time()
+                frame = self._grab_bgr(reg)
+                if frame is None:
+                    continue
+                fov_frame = frame
+                cv2.circle(fov_frame, (center, center), 4, (255, 255, 255), -1)
+                cv2.circle(fov_frame, (center, center), max(8, center - 2), (255, 180, 0), 1)
+                t_capture = (time.time() - t_capture_start) * 1000
+    
+                self.t_capture_list.append(t_capture)
+    
+                if t_capture > 20:  # 🔥 Adaptive sleep
+                    time.sleep(0.005)
+    
+                has_target = False
+                if self.state.running:
+                    while self.input_yolo_q.qsize() > 1:
+                        try:
+                            self.input_yolo_q.get_nowait()
+                        except Exception:
+                            break
+                    has_target, fov_frame = self._combat_step(fov_frame, center, reg, desktop_mode=cfg.desktop_test_mode)
+                    if not has_target or not cfg.nav_pause_when_enemy:
+                        self._navigation_step()
+                else:
+                    self.input_queue.put(('release_all',))
+                    self.state.target_lock_signal.emit([])
+    
+                self.state.frame_signal.emit(fov_frame)
+    
+                # 🔥 Расчет FPS
+                self.frame_count += 1
+                elapsed = time.time() - self.fps_start_time
+                if elapsed >= 1.0:
+                    self.fps = self.frame_count / elapsed
+                    t_capture_avg = sum(self.t_capture_list) / len(self.t_capture_list) if self.t_capture_list else 0
+                    t_infer_avg = sum(self.t_infer_list) / len(self.t_infer_list) if self.t_infer_list else 0
+                    t_post_avg = sum(self.t_post_list) / len(self.t_post_list) if self.t_post_list else 0
+                    t_input_avg = sum(self.t_input_list) / len(self.t_input_list) if self.t_input_list else 0
+                    latency_avg = sum(self.latency_list) / len(self.latency_list) if self.latency_list else 0
+                    self.state.performance_signal.emit(self.fps, latency_avg, t_capture_avg, t_infer_avg, t_post_avg, t_input_avg)
+                    self.frame_count = 0
+                    self.fps_start_time = time.time()
+                    self.t_capture_list = []
+                    self.t_infer_list = []
+                    self.t_post_list = []
+                    self.t_input_list = []
+                    self.latency_list = []
+    
+                # 🔥 Рандомизация cycle sleep
+                randomized_sleep = cfg.cycle_sleep_sec + random.uniform(-cfg.random_timing_variance, cfg.random_timing_variance)
+                randomized_sleep = max(0.001, randomized_sleep)  # Min bound
+                time.sleep(randomized_sleep)  # 🔥 Configurable sleep
+        finally:
+            if self.sct is not None:
+                try:
+                    self.sct.close()
+                except Exception:
+                    pass
+                self.sct = None
 
     def stop(self):
         self.stop_event.set()
