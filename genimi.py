@@ -1216,8 +1216,8 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         self.pid_y.clear()
         self._last_error_dist = 0  # Для трекинга изменений
 
-        # 🔥 MSS для захвата экрана
-        self.sct = mss.mss()
+        # 🔥 MSS инициализируем в run() (в том же потоке, где используем)
+        self.sct: Optional[mss.mss] = None
 
     def _input_worker(self) -> None:
         while True:
@@ -1663,6 +1663,8 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         return True, frame_bgr
 
     def _grab_bgr(self, region: dict[str, int]) -> Optional[np.ndarray]:
+        if self.sct is None:
+            return None
         try:
             shot = self.sct.grab({
                 "left": int(region["left"]),
@@ -1710,85 +1712,94 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         self.input_queue.put(('key_down', W_KEY))
 
     def run(self) -> None:  # 🔥 Теперь это метод QThread
-        monitor = self.sct.monitors[1]  # Основной монитор MSS
-        sw, sh = int(monitor["width"]), int(monitor["height"])
-        self.log("Поток бота запущен")
-        self.log(f"Debug-лог наведения: {self.aim_debug_file}")
+        self.sct = mss.mss()  # Важно: создаем в рабочем потоке (fix thread.local/srcdc)
+        try:
+            monitor = self.sct.monitors[1]  # Основной монитор MSS
+            sw, sh = int(monitor["width"]), int(monitor["height"])
+            self.log("Поток бота запущен")
+            self.log(f"Debug-лог наведения: {self.aim_debug_file}")
 
-        while not self.stop_event.is_set():
-            cfg = self.state.config
-            if cfg.desktop_test_mode != self._desktop_prev:
-                self.log(f"Режим проверки на рабочем столе: {'ВКЛ' if cfg.desktop_test_mode else 'ВЫКЛ'}")
-                self._desktop_prev = cfg.desktop_test_mode
-
-            combat_fov = int(cfg.combat_fov)
-            reg = {
-                "left": int(sw // 2 - combat_fov // 2),
-                "top": int(sh // 2 - combat_fov // 2),
-                "width": combat_fov,
-                "height": combat_fov,
-            }
-            center = combat_fov // 2
-
-            self.recorder.update()
-
-            if self.state.manual_route is not None:
-                self._load_route(self.state.manual_route)
-                self.state.manual_route = None
-
-            t_capture_start = time.time()
-            frame = self._grab_bgr(reg)
-            if frame is None:
-                continue
-            fov_frame = frame
-            cv2.circle(fov_frame, (center, center), 4, (255, 255, 255), -1)
-            cv2.circle(fov_frame, (center, center), max(8, center - 2), (255, 180, 0), 1)
-            t_capture = (time.time() - t_capture_start) * 1000
-
-            self.t_capture_list.append(t_capture)
-
-            if t_capture > 20:  # 🔥 Adaptive sleep
-                time.sleep(0.005)
-
-            has_target = False
-            if self.state.running:
-                while self.input_yolo_q.qsize() > 1:
-                    try:
-                        self.input_yolo_q.get_nowait()
-                    except Exception:
-                        break
-                has_target, fov_frame = self._combat_step(fov_frame, center, reg, desktop_mode=cfg.desktop_test_mode)
-                if not has_target or not cfg.nav_pause_when_enemy:
-                    self._navigation_step()
-            else:
-                self.input_queue.put(('release_all',))
-                self.state.target_lock_signal.emit([])
-
-            self.state.frame_signal.emit(fov_frame)
-
-            # 🔥 Расчет FPS
-            self.frame_count += 1
-            elapsed = time.time() - self.fps_start_time
-            if elapsed >= 1.0:
-                self.fps = self.frame_count / elapsed
-                t_capture_avg = sum(self.t_capture_list) / len(self.t_capture_list) if self.t_capture_list else 0
-                t_infer_avg = sum(self.t_infer_list) / len(self.t_infer_list) if self.t_infer_list else 0
-                t_post_avg = sum(self.t_post_list) / len(self.t_post_list) if self.t_post_list else 0
-                t_input_avg = sum(self.t_input_list) / len(self.t_input_list) if self.t_input_list else 0
-                latency_avg = sum(self.latency_list) / len(self.latency_list) if self.latency_list else 0
-                self.state.performance_signal.emit(self.fps, latency_avg, t_capture_avg, t_infer_avg, t_post_avg, t_input_avg)
-                self.frame_count = 0
-                self.fps_start_time = time.time()
-                self.t_capture_list = []
-                self.t_infer_list = []
-                self.t_post_list = []
-                self.t_input_list = []
-                self.latency_list = []
-
-            # 🔥 Рандомизация cycle sleep
-            randomized_sleep = cfg.cycle_sleep_sec + random.uniform(-cfg.random_timing_variance, cfg.random_timing_variance)
-            randomized_sleep = max(0.001, randomized_sleep)  # Min bound
-            time.sleep(randomized_sleep)  # 🔥 Configurable sleep
+            while not self.stop_event.is_set():
+                cfg = self.state.config
+                if cfg.desktop_test_mode != self._desktop_prev:
+                    self.log(f"Режим проверки на рабочем столе: {'ВКЛ' if cfg.desktop_test_mode else 'ВЫКЛ'}")
+                    self._desktop_prev = cfg.desktop_test_mode
+    
+                combat_fov = int(cfg.combat_fov)
+                reg = {
+                    "left": int(sw // 2 - combat_fov // 2),
+                    "top": int(sh // 2 - combat_fov // 2),
+                    "width": combat_fov,
+                    "height": combat_fov,
+                }
+                center = combat_fov // 2
+    
+                self.recorder.update()
+    
+                if self.state.manual_route is not None:
+                    self._load_route(self.state.manual_route)
+                    self.state.manual_route = None
+    
+                t_capture_start = time.time()
+                frame = self._grab_bgr(reg)
+                if frame is None:
+                    continue
+                fov_frame = frame
+                cv2.circle(fov_frame, (center, center), 4, (255, 255, 255), -1)
+                cv2.circle(fov_frame, (center, center), max(8, center - 2), (255, 180, 0), 1)
+                t_capture = (time.time() - t_capture_start) * 1000
+    
+                self.t_capture_list.append(t_capture)
+    
+                if t_capture > 20:  # 🔥 Adaptive sleep
+                    time.sleep(0.005)
+    
+                has_target = False
+                if self.state.running:
+                    while self.input_yolo_q.qsize() > 1:
+                        try:
+                            self.input_yolo_q.get_nowait()
+                        except Exception:
+                            break
+                    has_target, fov_frame = self._combat_step(fov_frame, center, reg, desktop_mode=cfg.desktop_test_mode)
+                    if not has_target or not cfg.nav_pause_when_enemy:
+                        self._navigation_step()
+                else:
+                    self.input_queue.put(('release_all',))
+                    self.state.target_lock_signal.emit([])
+    
+                self.state.frame_signal.emit(fov_frame)
+    
+                # 🔥 Расчет FPS
+                self.frame_count += 1
+                elapsed = time.time() - self.fps_start_time
+                if elapsed >= 1.0:
+                    self.fps = self.frame_count / elapsed
+                    t_capture_avg = sum(self.t_capture_list) / len(self.t_capture_list) if self.t_capture_list else 0
+                    t_infer_avg = sum(self.t_infer_list) / len(self.t_infer_list) if self.t_infer_list else 0
+                    t_post_avg = sum(self.t_post_list) / len(self.t_post_list) if self.t_post_list else 0
+                    t_input_avg = sum(self.t_input_list) / len(self.t_input_list) if self.t_input_list else 0
+                    latency_avg = sum(self.latency_list) / len(self.latency_list) if self.latency_list else 0
+                    self.state.performance_signal.emit(self.fps, latency_avg, t_capture_avg, t_infer_avg, t_post_avg, t_input_avg)
+                    self.frame_count = 0
+                    self.fps_start_time = time.time()
+                    self.t_capture_list = []
+                    self.t_infer_list = []
+                    self.t_post_list = []
+                    self.t_input_list = []
+                    self.latency_list = []
+    
+                # 🔥 Рандомизация cycle sleep
+                randomized_sleep = cfg.cycle_sleep_sec + random.uniform(-cfg.random_timing_variance, cfg.random_timing_variance)
+                randomized_sleep = max(0.001, randomized_sleep)  # Min bound
+                time.sleep(randomized_sleep)  # 🔥 Configurable sleep
+        finally:
+            if self.sct is not None:
+                try:
+                    self.sct.close()
+                except Exception:
+                    pass
+                self.sct = None
 
     def stop(self):
         self.stop_event.set()
