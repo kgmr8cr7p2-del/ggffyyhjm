@@ -47,7 +47,7 @@ from walk import RouteNavigator, SpawnDetector
 from pynput.keyboard import Key, Listener
 
 # 🔥 Для оптимизации захвата экрана
-import bettercam
+import mss
 
 
 @dataclass
@@ -1216,8 +1216,8 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         self.pid_y.clear()
         self._last_error_dist = 0  # Для трекинга изменений
 
-        # 🔥 BetterCam для захвата экрана
-        self.cam = bettercam.create(device=0, output_color="BGR", max_buffer_len=512)
+        # 🔥 MSS для захвата экрана
+        self.sct = mss.mss()
 
     def _input_worker(self) -> None:
         while True:
@@ -1662,12 +1662,31 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
 
         return True, frame_bgr
 
+    def _grab_bgr(self, region: dict[str, int]) -> Optional[np.ndarray]:
+        try:
+            shot = self.sct.grab({
+                "left": int(region["left"]),
+                "top": int(region["top"]),
+                "width": int(region["width"]),
+                "height": int(region["height"]),
+            })
+        except Exception as e:
+            self.log(f"Ошибка захвата экрана (mss): {e}")
+            return None
+        frame = np.array(shot)
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
     def _navigation_step(self) -> None:
-        mm_region = (self.MINIMAP_REGION["left"], self.MINIMAP_REGION["top"], self.MINIMAP_REGION["left"] + self.MINIMAP_REGION["width"], self.MINIMAP_REGION["top"] + self.MINIMAP_REGION["height"])
-        mm = self.cam.grab(mm_region)
+        mm_region = {
+            "left": self.MINIMAP_REGION["left"],
+            "top": self.MINIMAP_REGION["top"],
+            "width": self.MINIMAP_REGION["width"],
+            "height": self.MINIMAP_REGION["height"],
+        }
+        mm = self._grab_bgr(mm_region)
         if mm is None:
             return
-        minimap = cv2.cvtColor(mm, cv2.COLOR_BGRA2BGR) if mm.shape[2] == 4 else mm
+        minimap = mm
 
         pos = self._detect_arrow_position(minimap)
         if pos is None:
@@ -1691,8 +1710,8 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
         self.input_queue.put(('key_down', W_KEY))
 
     def run(self) -> None:  # 🔥 Теперь это метод QThread
-        mon = self.cam.get_latest_frame().shape  # BetterCam не имеет monitors, но можем взять размер экрана
-        sw, sh = mon[1], mon[0]  # width, height
+        monitor = self.sct.monitors[1]  # Основной монитор MSS
+        sw, sh = int(monitor["width"]), int(monitor["height"])
         self.log("Поток бота запущен")
         self.log(f"Debug-лог наведения: {self.aim_debug_file}")
 
@@ -1718,11 +1737,10 @@ class CombatWalkBot(QThread):  # 🔥 Изменено на QThread
                 self.state.manual_route = None
 
             t_capture_start = time.time()
-            region_tuple = (reg["left"], reg["top"], reg["left"] + reg["width"], reg["top"] + reg["height"])
-            frame = self.cam.grab(region_tuple)
+            frame = self._grab_bgr(reg)
             if frame is None:
                 continue
-            fov_frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR) if frame.shape[2] == 4 else frame
+            fov_frame = frame
             cv2.circle(fov_frame, (center, center), 4, (255, 255, 255), -1)
             cv2.circle(fov_frame, (center, center), max(8, center - 2), (255, 180, 0), 1)
             t_capture = (time.time() - t_capture_start) * 1000
